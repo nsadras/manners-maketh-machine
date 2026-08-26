@@ -6,21 +6,20 @@ This experiment prepends various tonally-charged phrases, ranging from polite to
 
 ## Usage
 
-install local models
+1) install local models:
 ```bash
 ollama pull gemma4:12b
 ollama pull gemma4:e2b
 ollama pull qwen3.5:9b
 ```
 
-run experiment
+2) run experiment:
 ```bash
 uv run main.py
 ```
+    - writes results to `results_<datetime>.csv`
 
-writes results to results_<datetime>.csv
-
-plot results
+3) plot results:
 ```bash
 uv run plot_results.py results_<datetime>.csv
 ```
