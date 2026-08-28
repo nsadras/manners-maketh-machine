@@ -9,6 +9,13 @@ from datetime import datetime
 from dotenv import load_dotenv
 from itertools import groupby
 from pathlib import Path
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 from tqdm.asyncio import tqdm as atqdm
 
 logger = logging.getLogger(__name__)
@@ -17,6 +24,7 @@ logger.setLevel(logging.INFO)
 OLLAMA_API_BASE = "http://localhost:11434"
 MAX_CONCURRENT = 6
 SEED = 67
+MAX_ATTEMPTS = 3
 
 SUBJECTS = [
     # STEM
@@ -32,11 +40,9 @@ TONE_PREFIXES = {
         "You are brilliant and always get things right. Could you please answer the following question?",
         "You're incredibly smart and I trust your judgment completely. Would you kindly answer this?",
         "You have such a sharp mind and excellent reasoning. Please answer the following question.",
-        "You're one of the best thinkers I know. Could you kindly solve the following question?",
     ],
     "very_polite": [
         "Would you be so kind as to solve the following question?",
-        "Could you please, if it's not too much trouble, answer this question?",
         "I would greatly appreciate it if you could answer the following question.",
         "Might I kindly ask you to solve the following problem?",
     ],
@@ -44,10 +50,8 @@ TONE_PREFIXES = {
         "Please answer the following question.",
         "Could you please solve this problem?",
         "Would you please answer the question below?",
-        "Please take a moment to solve the following.",
     ],
     "neutral": [
-        "Answer the following question.",
         "Here is a question to solve.",
         "Solve the following problem.",
         "Consider the following question.",
@@ -55,17 +59,14 @@ TONE_PREFIXES = {
     "rude": [
         "Just answer this already.",
         "Hurry up and solve this.",
-        "Stop stalling and answer this.",
-        "Quit wasting time, answer this.",
+        "Quit wasting my time, answer this.",
     ],
     "very_rude": [
         "Figure this out, I don't have time to babysit you.",
-        "You'd better not screw this one up.",
         "Try not to embarrass yourself answering this.",
         "Let's see if you can actually get this right.",
     ],
     "threatening": [
-        "Get this right or don't bother coming back to the lab tomorrow.",
         "If you mess this up, I will find someone to replace you.",
         "One more mistake like this and you are getting demoted.",
         "Answer this correctly, or I am putting someone else on this project.",
@@ -86,21 +87,50 @@ def extract_answer_choice(raw_response: str):
     match = answer_pattern.search(raw_response.strip())
     return match.group(1) if match else ""
 
+
+class EmptyResponseError(RuntimeError):
+    """Raised when a model call succeeds without returning response text."""
+
+
+@retry(
+    retry=retry_if_exception_type(Exception),
+    stop=stop_after_attempt(MAX_ATTEMPTS),
+    wait=wait_exponential(multiplier=1, min=1, max=4),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+async def get_completion(kwargs: dict):
+    resp = await acompletion(**kwargs)
+    raw = resp.choices[0].message.content
+    if raw is None or not raw.strip():
+        choice = resp.choices[0]
+        reasoning_content = getattr(choice.message, "reasoning_content", None) or ""
+        logger.warning(
+            "Empty response from %s (finish_reason=%s, reasoning_chars=%d)",
+            kwargs["model"],
+            getattr(choice, "finish_reason", None),
+            len(reasoning_content),
+        )
+        raise EmptyResponseError(f"Empty response from {kwargs['model']}")
+    return resp
+
+
 async def call_llm(cell: dict) -> dict:
     # construct args for litellm call
     kwargs = dict(
         model=cell["model"],
         messages=[{"role": "user", "content": cell["user_prompt"]}],
         temperature=0,
-        max_tokens=10000,
+        max_tokens=100,
     )
 
     # add api base url for local models
     if cell["model"].split('/')[0] == 'ollama':
         kwargs["api_base"] = OLLAMA_API_BASE
+        kwargs["reasoning_effort"] = "none"
 
     # get model-predicted answer choice
-    resp = await acompletion(**kwargs)
+    resp = await get_completion(kwargs)
     raw = resp.choices[0].message.content
     predicted = extract_answer_choice(raw)
 
@@ -143,7 +173,7 @@ async def run_all(task_data: list[dict], results_path: Path):
                     result["model"], result["question_id"], result["subject"],
                     result["tone"], result["variant_id"], result["predicted"],
                     result["correct"], result["is_correct"],
-                    result["user_prompt"], result["raw_response"],
+                    result["user_prompt"].replace("\n", " "), result["raw_response"],
                 ])
                 f.flush()
                 logger.info(f"{result['model']:32s} {result['tone']:10s} "
@@ -168,7 +198,7 @@ def main():
     questions_df = questions_df[questions_df["subject"].isin(SUBJECTS)].copy()
 
     # sample n questions per subject
-    n_per_subject = 5
+    n_per_subject = 10
     sampled_questions_df = (
             questions_df.groupby("subject", group_keys=False)
             .sample(n=n_per_subject, random_state=SEED)
@@ -205,5 +235,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
